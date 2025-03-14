@@ -1,0 +1,938 @@
+#Beta Version#
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import requests
+import json
+import random
+import string
+import threading
+import os
+import time
+import glob
+import datetime
+import sqlite3
+import winsound
+import tkinter.simpledialog as simpledialog
+import ttkbootstrap as tb
+from ttkbootstrap import Style
+import ttkbootstrap.dialogs as tb_dialogs  # for themed dialogs
+
+# ------------------ Global Constants and Variables ------------------ #
+CREDENTIALS_FILE = "credentials.json"
+MAX_CREDENTIALS = 10
+
+credentials = []        # Stored Okta credentials
+overview_data = {}      # Data retrieved from tenant overview
+overview_mapping = {}   # Maps tree item IDs in Overview tab to full JSON objects
+live_mapping = {}       # Maps tree item IDs in Live Events tab to full JSON objects
+transfer_data = {}      # Loaded saved objects for transfer
+transfer_mapping = {}   # Maps tree item IDs in Transfer tab to full JSON objects
+
+last_log_timestamp = None   # For live events
+transfer_cancelled = False  # Kill switch flag for transfer
+action_buttons = []         # Global list of buttons
+
+# Mapping from category name to creation endpoint (for Transfer)
+transfer_endpoint_map = {
+    "okta_users": "/api/v1/users?activate=true",
+    "okta_groups": "/api/v1/groups",
+    "okta_applications": "/api/v1/apps",
+    "okta_authz_policies": "/api/v1/authorizationServers/default/policies",
+    "okta_global_policies": "/api/v1/policies",  # We'll use query param type=OKTA_SIGN_ON
+    "okta_idps": "/api/v1/idps",
+    "okta_roles": "/api/v1/roles",
+    "okta_mappings": "/api/v1/mappings"
+}
+
+snapshot_dir = "snapshots"  # Global snapshot directory
+
+# ------------------ Helper Functions ------------------ #
+def reset_global_progress():
+    global_progress_bar['value'] = 0
+    global_meter.configure(amountused=0)
+    global_progress_label['text'] = "Ready."
+
+def toggle_theme():
+    """Cycle through the available ttkbootstrap themes each time it's clicked."""
+    available_themes = style.theme_names()
+    current_theme = style.theme_use()
+    next_theme_index = (available_themes.index(current_theme) + 1) % len(available_themes)
+    new_theme = available_themes[next_theme_index]
+    style.theme_use(new_theme)
+    log_console(f"Theme toggled to {new_theme}")
+
+def smooth_progress_update(value):
+    global_progress_bar['value'] = value
+    global_meter.configure(amountused=value)
+    root.update_idletasks()
+
+def update_progress_start(action):
+    global_progress_label['text'] = f"Starting {action}..."
+    smooth_progress_update(0)
+    global_progress_bar['maximum'] = 100
+    global_meter.configure(amounttotal=100)
+
+def update_progress_complete(action):
+    smooth_progress_update(100)
+    global_progress_label['text'] = f"{action} complete."
+    root.update_idletasks()
+    reset_global_progress()
+    winsound.Beep(600, 200)
+
+def load_credentials_from_file():
+    update_progress_start("Loading credentials")
+    if os.path.exists(CREDENTIALS_FILE):
+        try:
+            with open(CREDENTIALS_FILE, 'r', encoding='utf-8') as f:
+                credentials_data = json.load(f)
+            credentials.clear()
+            credentials.extend(credentials_data)
+            log_console("Credentials loaded successfully.")
+        except Exception as e:
+            log_console(f"Error loading credentials: {e}")
+            winsound.Beep(300, 500)  # Beep on error
+    else:
+        credentials.clear()
+        log_console("Credentials file not found. Starting with an empty list.")
+    update_progress_complete("Loading credentials")
+
+def save_credentials_to_file():
+    update_progress_start("Saving credentials")
+    try:
+        with open(CREDENTIALS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(credentials, f, indent=2)
+        log_console("Credentials saved successfully.")
+    except Exception as e:
+        log_console(f"Error saving credentials: {e}")
+        winsound.Beep(300, 500)  # Beep on error
+    update_progress_complete("Saving credentials")
+
+def normalize_url(url):
+    return url.rstrip('/')
+
+def validate_okta_url(url):
+    return url.startswith("http://") or url.startswith("https://")
+
+def generate_random_string(length=6):
+    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
+
+def format_json_response(text):
+    try:
+        parsed = json.loads(text)
+        return json.dumps(parsed, indent=2)
+    except Exception:
+        return text
+
+def log_console(text):
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    console_text.configure(state='normal')
+    console_text.insert(tk.END, f"[{timestamp}] {text}\n")
+    console_text.configure(state='disabled')
+    console_text.see(tk.END)
+
+def clear_console():
+    console_text.configure(state='normal')
+    console_text.delete(1.0, tk.END)
+    console_text.configure(state='disabled')
+
+def disable_action_buttons(disable=True):
+    state = tk.DISABLED if disable else tk.NORMAL
+    for btn in action_buttons:
+        try:
+            btn.config(state=state)
+        except Exception:
+            pass
+
+def api_get(url, headers, params=None, max_retries=5, initial_wait=1):
+    retries = 0
+    wait_time = initial_wait
+    response = None
+
+    while retries < max_retries:
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After")
+            sleep_time = int(retry_after) if (retry_after and retry_after.isdigit()) else wait_time
+            log_console(
+                f"Rate limited for URL: {url} with params: {params}. "
+                f"Waiting for {sleep_time} seconds... (Retry {retries + 1}/{max_retries})"
+            )
+            time.sleep(sleep_time)
+            wait_time *= 2
+            retries += 1
+        else:
+            return response
+
+    if response:
+        log_console(
+            f"Max retries reached for URL: {url} with params: {params}. "
+            f"Final status: {response.status_code} - {response.text}"
+        )
+    return response
+
+def get_label_for_object(obj):
+    if isinstance(obj, dict):
+        if "label" in obj:
+            label = obj["label"]
+        elif "profile" in obj:
+            prof = obj["profile"]
+            if "login" in prof:
+                label = prof["login"]
+            elif "firstName" in prof and "lastName" in prof:
+                label = f"{prof['firstName']} {prof['lastName']}"
+            elif "name" in prof:
+                label = prof["name"]
+            else:
+                label = "N/A"
+        elif "name" in obj:
+            label = obj["name"]
+        else:
+            label = "N/A"
+        id_val = obj.get("id", "N/A")
+        return f"{label} ({id_val})"
+    return str(obj)
+
+def clean_object(obj):
+    if not isinstance(obj, dict):
+        return obj
+    cleaned = obj.copy()
+    for field in [
+        "id", "created", "activated", "statusChanged", "lastLogin", "lastUpdated",
+        "passwordChanged", "_links"
+    ]:
+        cleaned.pop(field, None)
+    return cleaned
+
+def clean_app_object(obj):
+    if not isinstance(obj, dict):
+        return obj
+    cleaned = clean_object(obj)
+    return cleaned
+
+snapshot_files = []
+
+def init_snapshots():
+    if not os.path.exists(snapshot_dir):
+        os.makedirs(snapshot_dir)
+    snapshots = sorted(
+        glob.glob(os.path.join(snapshot_dir, "snapshot_*.json")),
+        key=os.path.getmtime,
+        reverse=True
+    )
+
+    snapshot_listbox.delete(0, tk.END)
+    snapshot_files.clear()
+
+    for file in snapshots:
+        try:
+            with open(file, "r") as f:
+                data = json.load(f)
+            tenant_url = data.get("tenant_url", "UnknownTenant")
+            timestamp = data.get("timestamp", "UnknownTime")
+            snapshot_listbox.insert(tk.END, f"{tenant_url} - {timestamp}")
+            snapshot_files.append(file)
+        except Exception as e:
+            log_console(f"Error loading snapshot file {file}: {str(e)}")
+            winsound.Beep(300, 500)
+
+def delete_selected_snapshot():
+    selection = snapshot_listbox.curselection()
+    if not selection:
+        return
+    index = selection[0]
+    file_to_delete = snapshot_files[index]
+    try:
+        os.remove(file_to_delete)
+        log_console(f"Snapshot deleted: {file_to_delete}")
+    except OSError as e:
+        log_console(f"Failed to delete snapshot: {str(e)}")
+        winsound.Beep(300, 500)
+    init_snapshots()
+
+def save_snapshot(tenant_url, data):
+    now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = os.path.join(snapshot_dir, f"snapshot_{now}.json")
+    snapshot = {"tenant_url": tenant_url, "timestamp": now, "data": data}
+
+    try:
+        with open(filename, "w") as f:
+            json.dump(snapshot, f, indent=2)
+        log_console(f"Snapshot saved: {filename}")
+    except Exception as e:
+        log_console(f"Error saving snapshot: {e}")
+        winsound.Beep(300, 500)
+    init_snapshots()
+
+def load_selected_snapshot_to_transfer():
+    update_progress_start("Loading snapshot to Transfer")
+    log_console("Attempting to load snapshot into Transfer Objects...")
+    try:
+        selection = snapshot_listbox.curselection()
+        if not selection:
+            log_console("No snapshot selected.")
+            return
+        filename = snapshot_files[selection[0]]
+        snapshot_path = filename
+        if not os.path.exists(snapshot_path):
+            log_console(f"Snapshot file not found: {snapshot_path}")
+            return
+
+        transfer_data.clear()
+        for item in transfer_tree.get_children():
+            transfer_tree.delete(item)
+
+        with open(snapshot_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        transfer_data.update(data.get("data", {}))
+        root_node = transfer_tree.insert("", "end", text="Loaded Snapshot Transfer", open=True)
+        transfer_mapping[root_node] = None
+
+        def insert_items(parent, items):
+            if isinstance(items, list):
+                for obj in items:
+                    label = get_label_for_object(obj)
+                    child_node = transfer_tree.insert(parent, "end", text=label, open=True, values=("No",))
+                    transfer_mapping[child_node] = obj
+                    if isinstance(obj, dict):
+                        for k, v in obj.items():
+                            if isinstance(v, (dict, list)):
+                                sub_parent = transfer_tree.insert(child_node, "end", text=k, open=True, values=("No",))
+                                transfer_mapping[sub_parent] = None
+                                insert_items(sub_parent, v)
+            elif isinstance(items, dict):
+                for key, value in items.items():
+                    sub_parent = transfer_tree.insert(parent, "end", text=key, open=True, values=("No",))
+                    transfer_mapping[sub_parent] = None
+                    insert_items(sub_parent, value)
+
+        for section_name, items in transfer_data.items():
+            section_node = transfer_tree.insert(root_node, "end", text=section_name, open=True, values=("No",))
+            transfer_mapping[section_node] = None
+            insert_items(section_node, items)
+
+        log_console("Snapshot successfully loaded to Transfer Objects.")
+        winsound.Beep(700, 200)
+    except Exception as e:
+        log_console(f"Error loading snapshot to Transfer Objects tab: {e}")
+        winsound.Beep(300, 500)
+    update_progress_complete("Loading snapshot to Transfer")
+
+def load_selected_snapshot_to_overview():
+    update_progress_start("Loading snapshot to Overview")
+    log_console("Attempting to load snapshot into Tenant Objects...")
+    try:
+        selection = snapshot_listbox.curselection()
+        if not selection:
+            log_console("No snapshot selected.")
+            return
+
+        filename = snapshot_files[selection[0]]
+        if not os.path.exists(filename):
+            log_console(f"Snapshot file not found: {filename}")
+            return
+
+        overview_data.clear()
+        for item in overview_tree.get_children():
+            overview_tree.delete(item)
+
+        with open(filename, "r", encoding="utf-8") as f:
+            snapshot_json = json.load(f)
+
+        loaded_data = snapshot_json.get("data", {})
+        overview_data.update(loaded_data)
+
+        root_node = overview_tree.insert("", "end", text="Loaded Snapshot Overview", open=True)
+        overview_mapping[root_node] = None
+
+        # The shape is the same as after we do "fetch objects": 
+        # top-level keys are "Directory", "Applications", "Security", etc.
+        for section_name, section_content in overview_data.items():
+            section_node = overview_tree.insert(root_node, "end", text=section_name, open=True)
+            overview_mapping[section_node] = None
+
+            if isinstance(section_content, dict):
+                for resource_name, objects_list in section_content.items():
+                    resource_node = overview_tree.insert(section_node, "end",
+                                                         text=resource_name, open=True)
+                    overview_mapping[resource_node] = None
+                    if isinstance(objects_list, list):
+                        for obj in objects_list:
+                            label = get_label_for_object(obj)
+                            obj_node = overview_tree.insert(resource_node, "end", text=label, open=False)
+                            overview_mapping[obj_node] = obj
+                    else:
+                        log_console(f"Warning: {resource_name} is not a list in snapshot.")
+            else:
+                log_console(f"Warning: Section {section_name} is not a dict in snapshot data.")
+
+        log_console("Snapshot successfully loaded to Tenant Objects.")
+        winsound.Beep(700, 200)
+    except Exception as e:
+        log_console(f"Error loading snapshot to Tenant Objects tab: {e}")
+        winsound.Beep(300, 500)
+    update_progress_complete("Loading snapshot to Overview")
+
+def verify_credential(cred):
+    try:
+        headers = {
+            "Authorization": f"SSWS {cred['api_key']}",
+            "Accept": "application/json"
+        }
+        url = f"{normalize_url(cred['okta_url'])}/api/v1/users?limit=1"
+        response = requests.get(url, headers=headers, timeout=5)
+        log_console(f"Verifying credentials at {url}: Status Code {response.status_code}")
+        if response.status_code == 200:
+            apps_resp = requests.get(f"{cred['okta_url']}/api/v1/apps", headers=headers)
+            if apps_resp.ok:
+                found_acsense = any(
+                    app.get("label") == "Acsense-Provisioning" and app.get("status") == "ACTIVE"
+                    for app in apps_resp.json()
+                )
+                if found_acsense:
+                    cred["has_acsense"] = True
+                    log_console("Acsense provisioning detected.")
+            return True
+        elif response.status_code in [401, 403]:
+            log_console(f"Verification failed: {response.status_code} - {response.text}")
+            return False
+        else:
+            log_console(f"Non-200 response {response.status_code}, not marking credential as invalid.")
+            return True
+    except Exception as e:
+        log_console(f"Verification error for {cred['okta_url']}: {e}")
+        return False
+
+def update_credentials_listbox():
+    credentials_listbox.delete(0, tk.END)
+    for idx, cred in enumerate(credentials):
+        valid = verify_credential(cred)
+        status = "Valid" if valid else "Expired/Invalid"
+        display_text = f"{idx+1}. {cred['okta_url'].rstrip('/')} ({status})"
+        credentials_listbox.insert(tk.END, display_text)
+        credentials_listbox.itemconfig(idx, foreground="green" if valid else "red")
+
+def save_current_credential():
+    okta_url = normalize_url(okta_url_entry.get().strip())
+    api_key = api_key_entry.get().strip()
+    if not okta_url or not api_key:
+        log_console("Both Okta URL and API Key are required to save credentials.")
+        return
+
+    if not validate_okta_url(okta_url):
+        log_console("Invalid Okta URL. It must start with http:// or https://")
+        return
+
+    for cred in credentials:
+        if cred["okta_url"] == okta_url and cred["api_key"] == api_key:
+            log_console("These credentials are already saved.")
+            return
+
+    if len(credentials) >= MAX_CREDENTIALS:
+        log_console(f"Maximum of {MAX_CREDENTIALS} credentials reached. Delete one before saving a new one.")
+        return
+
+    credentials.append({"okta_url": okta_url, "api_key": api_key})
+    save_credentials_to_file()
+    update_credentials_listbox()
+    log_console("Credential saved successfully.")
+
+def load_selected_credential():
+    try:
+        selection = credentials_listbox.curselection()
+        if not selection:
+            log_console("Please select a credential to load.")
+            return
+        index = selection[0]
+        cred = credentials[index]
+        okta_url_entry.delete(0, tk.END)
+        okta_url_entry.insert(0, cred["okta_url"])
+        api_key_entry.delete(0, tk.END)
+        api_key_entry.insert(0, cred["api_key"])
+
+        valid = verify_credential(cred)
+        color = "lightgreen" if valid else "lightcoral"
+        okta_url_entry.config(bg=color)
+        api_key_entry.config(bg=color)
+        log_console("Credential loaded.")
+    except Exception as e:
+        log_console(f"Error loading credential: {e}")
+        winsound.Beep(300, 500)
+
+def delete_selected_credential():
+    try:
+        selection = credentials_listbox.curselection()
+        if not selection:
+            log_console("Please select a credential to delete.")
+            return
+        index = selection[0]
+        del credentials[index]
+        save_credentials_to_file()
+        update_credentials_listbox()
+        log_console("Credential deleted.")
+    except Exception as e:
+        log_console(f"Error deleting credential: {e}")
+        winsound.Beep(300, 500)
+
+def create_random_user():
+    update_progress_start("Creating random user")
+    # Implementation unchanged...
+    # ...
+    pass  # For brevity in this snippet
+
+def create_random_group():
+    update_progress_start("Creating random group")
+    # Implementation unchanged...
+    pass
+
+def create_random_app():
+    update_progress_start("Creating random app")
+    # Implementation unchanged...
+    pass
+
+def create_super_admin():
+    update_progress_start("Creating Super Admin")
+    # Implementation unchanged...
+    pass
+
+def create_database():
+    conn = sqlite3.connect('okta_objects.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            first_name TEXT,
+            last_name TEXT,
+            email TEXT,
+            login TEXT,
+            json_data TEXT
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS groups (
+            id TEXT PRIMARY KEY,
+            name TEXT,
+            description TEXT,
+            json_data TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def insert_user_into_db(user):
+    conn = sqlite3.connect('okta_objects.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT OR REPLACE INTO users (id, first_name, last_name, email, login, json_data)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (
+        user['id'],
+        user['profile'].get('firstName', ''),
+        user['profile'].get('lastName', ''),
+        user['profile'].get('email', ''),
+        user['profile'].get('login', ''),
+        json.dumps(user)
+    ))
+    conn.commit()
+    conn.close()
+
+def insert_group_into_db(group):
+    conn = sqlite3.connect('okta_objects.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT OR REPLACE INTO groups (id, name, description, json_data)
+        VALUES (?, ?, ?, ?)
+    ''', (
+        group['id'],
+        group['profile'].get('name', ''),
+        group['profile'].get('description', ''),
+        json.dumps(group)
+    ))
+    conn.commit()
+    conn.close()
+
+def retrieve_overview():
+    update_progress_start("Retrieving tenant overview")
+    # Implementation for fetching data from Okta and building overview_data
+    # plus saving a snapshot. Unchanged from your snippet.
+    pass
+
+def save_overview_to_file():
+    # Implementation unchanged
+    pass
+
+def delete_selected_overview_objects():
+    # Implementation unchanged
+    pass
+
+def delete_object_from_target():
+    # Implementation unchanged
+    pass
+
+def reset_user_password():
+    # Implementation unchanged
+    pass
+
+def retrieve_live_events():
+    update_progress_start("Retrieving live events")
+    # Implementation unchanged
+    pass
+
+def on_live_tree_select(event):
+    # Implementation unchanged
+    pass
+
+def load_saved_objects():
+    update_progress_start("Loading saved objects")
+    # Implementation unchanged
+    pass
+
+def search_objects():
+    # Implementation unchanged
+    pass
+
+def toggle_transfer_selection(event):
+    # Implementation unchanged
+    pass
+
+def load_target_credential():
+    # Implementation unchanged
+    pass
+
+def transfer_objects():
+    update_progress_start("Transferring objects")
+    # Implementation unchanged
+    pass
+
+def cancel_transfer():
+    # Implementation unchanged
+    pass
+
+def on_overview_tree_select(event):
+    # Implementation unchanged
+    pass
+
+def on_transfer_tree_select(event):
+    # Implementation unchanged
+    pass
+
+def run_threaded(task_func):
+    def wrapper():
+        try:
+            task_func()
+        finally:
+            disable_action_buttons(False)
+    thread = threading.Thread(target=wrapper, daemon=True)
+    thread.start()
+
+# ------------------ UI Setup ------------------ #
+style = Style(theme="flatly")
+root = style.master
+root.title("Okta API Tool")
+
+filter_frame = tk.Frame(root, padx=10, pady=5)
+filter_frame.pack(fill=tk.X)
+date_entry = tb.DateEntry(filter_frame, bootstyle="primary", dateformat='%Y-%m-%d')
+date_entry.pack(side=tk.LEFT, padx=5)
+tk.Label(filter_frame, text="Filter by Date:").pack(side=tk.LEFT, padx=5)
+
+top_frame = tk.Frame(root, padx=10, pady=10)
+top_frame.pack(fill=tk.X)
+
+# Theme Change Button
+theme_toggle = tb.Button(top_frame, text="Toggle Theme", bootstyle="outline-primary", command=toggle_theme)
+theme_toggle.grid(row=0, column=5, padx=5, pady=2)
+
+tk.Label(top_frame, text="Okta URL:").grid(row=0, column=0, sticky="w")
+okta_url_entry = tk.Entry(top_frame, width=50)
+okta_url_entry.grid(row=0, column=1, padx=5, pady=2)
+
+tk.Label(top_frame, text="Example: https://yourOktaDomain.okta.com", fg="gray").grid(
+    row=1, column=1, sticky="w"
+)
+
+tk.Label(top_frame, text="API Key:").grid(row=0, column=2, sticky="w")
+api_key_entry = tk.Entry(top_frame, width=40, show="*")
+api_key_entry.grid(row=0, column=3, padx=5, pady=2)
+
+# Credentials & Snapshots side by side in the SAME ROW
+cred_snap_frame = tk.Frame(top_frame)
+cred_snap_frame.grid(row=2, column=0, columnspan=6, sticky="ew", pady=5)
+
+cred_frame = tk.LabelFrame(cred_snap_frame, text="Stored Credentials", padx=5, pady=5)
+cred_frame.grid(row=0, column=0, sticky="nw")  # row=0, col=0 so it's side by side with snapshots
+
+credentials_listbox = tk.Listbox(cred_frame, height=6, width=80)
+credentials_listbox.grid(row=0, column=0, columnspan=3, padx=5, pady=5)
+
+save_cred_button = tk.Button(cred_frame, text="Save Credential", command=save_current_credential)
+save_cred_button.grid(row=1, column=0, padx=5, pady=2)
+
+load_cred_button = tk.Button(cred_frame, text="Load Credential", command=load_selected_credential)
+load_cred_button.grid(row=1, column=1, padx=5, pady=2)
+
+delete_cred_button = tk.Button(cred_frame, text="Delete Credential", command=delete_selected_credential)
+delete_cred_button.grid(row=1, column=2, padx=5, pady=2)
+
+action_buttons.extend([save_cred_button, load_cred_button, delete_cred_button])
+
+snapshots_frame = tk.LabelFrame(cred_snap_frame, text="Snapshots", padx=5, pady=5)
+snapshots_frame.grid(row=0, column=1, sticky="nw", padx=10)  # same row=0, col=1 => side by side
+
+snapshot_listbox = tk.Listbox(snapshots_frame, height=6, width=80)
+snapshot_listbox.grid(row=0, column=0, columnspan=3, padx=5, pady=5)
+
+snap_btn_frame = tk.Frame(snapshots_frame)
+snap_btn_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
+
+load_snapshot_button = tk.Button(
+    snap_btn_frame, text="Load Snapshot to Transfer", command=load_selected_snapshot_to_transfer
+)
+load_snapshot_button.pack(side=tk.LEFT, padx=5)
+
+load_snapshot_overview_button = tk.Button(
+    snap_btn_frame, text="Load Snapshot to Overview", command=load_selected_snapshot_to_overview
+)
+load_snapshot_overview_button.pack(side=tk.LEFT, padx=5)
+
+delete_snapshot_button = tk.Button(snap_btn_frame, text="Delete Snapshot", command=delete_selected_snapshot)
+delete_snapshot_button.pack(side=tk.LEFT, padx=5)
+
+init_snapshots()
+
+# Now place the circular meter to the RIGHT of these frames
+meter_frame = tk.Frame(cred_snap_frame, padx=5, pady=5)
+meter_frame.grid(row=0, column=2, sticky="nw")
+
+global_meter = tb.Meter(
+    meter_frame,
+    bootstyle="primary",
+    subtext="Progress",
+    amountused=0,
+    amounttotal=100,
+    interactive=False
+)
+global_meter.pack(padx=5, pady=5)
+
+global_progress_frame = tk.Frame(root, padx=10, pady=5)
+global_progress_frame.pack(fill=tk.X)
+global_progress_label = tk.Label(global_progress_frame, text="Ready.")
+global_progress_label.pack(side=tk.LEFT, padx=5)
+global_progress_bar = tb.Progressbar(
+    global_progress_frame,
+    orient="horizontal",
+    length=400,
+    mode="determinate",
+    bootstyle="striped"
+)
+global_progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+notebook = ttk.Notebook(root)
+notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+# Super Admin Tab
+super_admin_tab = tk.Frame(notebook)
+notebook.add(super_admin_tab, text="Super Admin")
+
+super_admin_frame = tk.LabelFrame(super_admin_tab, text="Super Admin Creation", padx=5, pady=5)
+super_admin_frame.pack(fill=tk.X, pady=5)
+
+tk.Label(super_admin_frame, text="First Name:").grid(row=0, column=0, sticky="w")
+super_admin_first_entry = tk.Entry(super_admin_frame, width=15)
+super_admin_first_entry.grid(row=0, column=1, padx=5, pady=2)
+
+tk.Label(super_admin_frame, text="Last Name:").grid(row=0, column=2, sticky="w")
+super_admin_last_entry = tk.Entry(super_admin_frame, width=15)
+super_admin_last_entry.grid(row=0, column=3, padx=5, pady=2)
+
+tk.Label(super_admin_frame, text="Email:").grid(row=1, column=0, sticky="w")
+super_admin_email_entry = tk.Entry(super_admin_frame, width=15)
+super_admin_email_entry.grid(row=1, column=1, padx=5, pady=2)
+
+tk.Label(super_admin_frame, text="Login:").grid(row=1, column=2, sticky="w")
+super_admin_login_entry = tk.Entry(super_admin_frame, width=15)
+super_admin_login_entry.grid(row=1, column=3, padx=5, pady=2)
+
+super_admin_button = tk.Button(
+    super_admin_frame,
+    text="Generate Super Admin",
+    command=lambda: run_threaded(create_super_admin)
+)
+super_admin_button.grid(row=2, column=0, columnspan=4, pady=5)
+action_buttons.append(super_admin_button)
+
+# Console Tab
+console_frame = tk.Frame(notebook)
+notebook.add(console_frame, text="Console")
+
+console_text = tk.Text(console_frame, height=15, state="disabled")
+console_text.pack(fill=tk.BOTH, expand=True)
+
+clear_console_button = tk.Button(console_frame, text="Clear Console", command=clear_console)
+clear_console_button.pack(pady=2)
+action_buttons.append(clear_console_button)
+
+# Tenant Overview Tab
+overview_frame = tk.Frame(notebook)
+notebook.add(overview_frame, text="Tenant Objects")
+
+overview_toolbar = tk.Frame(overview_frame)
+overview_toolbar.pack(fill=tk.X, padx=5, pady=5)
+
+refresh_overview_button = tk.Button(
+    overview_toolbar, text="Fetch Objects", command=lambda: run_threaded(retrieve_overview)
+)
+refresh_overview_button.pack(side=tk.LEFT, padx=5)
+
+save_overview_button = tk.Button(overview_toolbar, text="Save Objects", command=save_overview_to_file)
+save_overview_button.pack(side=tk.LEFT, padx=5)
+
+delete_overview_button = tk.Button(
+    overview_toolbar, text="Delete Selected", command=delete_selected_overview_objects
+)
+delete_overview_button.pack(side=tk.LEFT, padx=5)
+
+delete_target_button = tk.Button(
+    overview_toolbar, text="Delete From Target", command=delete_object_from_target
+)
+delete_target_button.pack(side=tk.LEFT, padx=5)
+
+reset_password_button = tk.Button(
+    overview_toolbar, text="Reset Password", command=lambda: run_threaded(reset_user_password)
+)
+reset_password_button.pack(side=tk.LEFT, padx=5)
+action_buttons.append(reset_password_button)
+action_buttons.extend([
+    refresh_overview_button, save_overview_button, delete_overview_button, delete_target_button
+])
+
+overview_paned = ttk.PanedWindow(overview_frame, orient=tk.HORIZONTAL)
+overview_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+tree_frame = tk.Frame(overview_paned)
+overview_tree = ttk.Treeview(tree_frame)
+overview_tree.heading("#0", text="Tenant Objects", anchor="w")
+overview_tree.pack(fill=tk.BOTH, expand=True)
+overview_paned.add(tree_frame, weight=2)
+
+details_frame = tk.Frame(overview_paned)
+details_text = tk.Text(details_frame, state="disabled")
+details_text.pack(fill=tk.BOTH, expand=True)
+overview_paned.add(details_frame, weight=1)
+
+overview_tree.bind("<<TreeviewSelect>>", on_overview_tree_select)
+
+# Live Events Tab
+live_frame = tk.Frame(notebook)
+notebook.add(live_frame, text="Live Events")
+
+live_toolbar = tk.Frame(live_frame)
+live_toolbar.pack(fill=tk.X, padx=5, pady=5)
+
+update_logs_button = tk.Button(
+    live_toolbar, text="Update Logs", command=lambda: run_threaded(retrieve_live_events)
+)
+update_logs_button.pack(side=tk.LEFT, padx=5)
+action_buttons.append(update_logs_button)
+
+live_paned = ttk.PanedWindow(live_frame, orient=tk.HORIZONTAL)
+live_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+logs_tree_frame = tk.Frame(live_paned)
+live_tree = ttk.Treeview(logs_tree_frame, columns=("Event Type", "Published", "Actor"), show="headings")
+live_tree.heading("Event Type", text="Event Type")
+live_tree.heading("Published", text="Published")
+live_tree.heading("Actor", text="Actor")
+live_tree.pack(fill=tk.BOTH, expand=True)
+live_paned.add(logs_tree_frame, weight=2)
+
+logs_details_frame = tk.Frame(live_paned)
+logs_details_text = tk.Text(logs_details_frame, state="disabled")
+logs_details_text.pack(fill=tk.BOTH, expand=True)
+live_paned.add(logs_details_frame, weight=1)
+
+live_tree.bind("<<TreeviewSelect>>", on_live_tree_select)
+
+# Transfer Objects Tab
+transfer_frame = tk.Frame(notebook)
+notebook.add(transfer_frame, text="Transfer Objects")
+
+transfer_paned = ttk.PanedWindow(transfer_frame, orient=tk.HORIZONTAL)
+transfer_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+transfer_left_frame = tk.Frame(transfer_paned)
+load_objects_button = tk.Button(transfer_left_frame, text="Load Saved Objects", command=load_saved_objects)
+load_objects_button.pack(fill=tk.X, padx=5, pady=2)
+
+search_entry = tk.Entry(transfer_left_frame, state=tk.DISABLED)
+search_entry.pack(fill=tk.X, padx=5, pady=2)
+
+search_button = tk.Button(transfer_left_frame, text="Search", command=search_objects)
+search_button.pack(fill=tk.X, padx=5, pady=2)
+
+transfer_tree = ttk.Treeview(transfer_left_frame, columns=("Selected",), show="tree headings")
+transfer_tree.heading("#0", text="Object")
+transfer_tree.heading("Selected", text="Selected")
+transfer_tree.column("Selected", width=70, anchor="center")
+transfer_tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+transfer_tree.bind("<Double-1>", toggle_transfer_selection)
+transfer_tree.bind("<<TreeviewSelect>>", on_transfer_tree_select)
+
+transfer_paned.add(transfer_left_frame, weight=2)
+
+transfer_right_frame = tk.Frame(transfer_paned)
+
+tk.Label(transfer_right_frame, text="Target Tenant URL:").pack(anchor="w", padx=5, pady=2)
+target_url_entry = tk.Entry(transfer_right_frame, width=40)
+target_url_entry.pack(padx=5, pady=2)
+
+tk.Label(transfer_right_frame, text="Target API Key:").pack(anchor="w", padx=5, pady=2)
+target_api_key_entry = tk.Entry(transfer_right_frame, width=40, show="*")
+target_api_key_entry.pack(padx=5, pady=2)
+
+load_target_button = tk.Button(transfer_right_frame, text="Load Credential", command=load_target_credential)
+load_target_button.pack(padx=5, pady=2)
+
+transfer_button = tk.Button(
+    transfer_right_frame, text="Transfer Selected", command=lambda: run_threaded(transfer_objects)
+)
+transfer_button.pack(padx=5, pady=2)
+
+cancel_transfer_button = tk.Button(transfer_right_frame, text="Cancel Transfer", command=cancel_transfer)
+cancel_transfer_button.pack(padx=5, pady=2)
+
+transfer_paned.add(transfer_right_frame, weight=1)
+action_buttons.extend([load_objects_button, search_button, load_target_button, transfer_button, cancel_transfer_button])
+
+# Additional Button Frame
+button_frame = tk.Frame(root, padx=10, pady=5)
+button_frame.pack(fill=tk.X)
+
+user_button = tk.Button(button_frame, text="Generate Random User", command=lambda: run_threaded(create_random_user))
+user_button.pack(side=tk.LEFT, padx=5)
+
+group_button = tk.Button(button_frame, text="Generate Random Group", command=lambda: run_threaded(create_random_group))
+group_button.pack(side=tk.LEFT, padx=5)
+
+app_button = tk.Button(button_frame, text="Generate Random Application", command=lambda: run_threaded(create_random_app))
+app_button.pack(side=tk.LEFT, padx=5)
+action_buttons.extend([user_button, group_button, app_button])
+
+def create_accsense_test_users():
+    # Implementation unchanged
+    pass
+
+accsense_button = tk.Button(button_frame, text="Generate Accsense Test Users",
+                            command=lambda: run_threaded(create_accsense_test_users))
+accsense_button.pack(side=tk.LEFT, padx=5)
+action_buttons.append(accsense_button)
+
+# The "Object Creation" tab...
+# code is unchanged except your new "load_selected_credential_to_creation", etc.
+
+create_database()
+load_credentials_from_file()
+update_credentials_listbox()
+
+root.mainloop()

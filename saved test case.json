@@ -1,0 +1,174 @@
+[
+  {
+    "event_type": "user.create",
+    "request_body": {
+      "profile": {
+        "firstName": "UserOne",
+        "lastName": "LastA",
+        "email": "userone@example.com",
+        "login": "userone@example.com"
+      },
+      "credentials": {
+        "password": {
+          "value": "TempPass123"
+        }
+      },
+      "activate": true
+    }
+  },
+  {
+    "event_type": "user.create",
+    "request_body": {
+      "profile": {
+        "firstName": "UserTwo",
+        "lastName": "LastB",
+        "email": "usertwo@example.com",
+        "login": "usertwo@example.com"
+      },
+      "credentials": {
+        "password": {
+          "value": "TempPass123"
+        }
+      },
+      "activate": true
+    }
+  },
+  {
+    "event_type": "user.create",
+    "request_body": {
+      "profile": {
+        "firstName": "UserThree",
+        "lastName": "LastC",
+        "email": "userthree@example.com",
+        "login": "userthree@example.com"
+      },
+      "credentials": {
+        "password": {
+          "value": "TempPass123"
+        }
+      },
+      "activate": true
+    }
+  },
+  {
+    "event_type": "group.create",
+    "request_body": {
+      "profile": {
+        "name": "GroupOne",
+        "description": "First group"
+      }
+    }
+  },
+  {
+    "event_type": "group.create",
+    "request_body": {
+      "profile": {
+        "name": "GroupTwo",
+        "description": "Second group"
+      }
+    }
+  },
+  {
+    "event_type": "group.create",
+    "request_body": {
+      "profile": {
+        "name": "GroupThree",
+        "description": "Third group"
+      }
+    }
+  },
+  {
+    "event_type": "app.create",
+    "request_body": {
+      "name": "oidc_client",
+      "label": "My OIDC App",
+      "signOnMode": "OPENID_CONNECT",
+      "credentials": {
+        "oauthClient": {
+          "token_endpoint_auth_method": "client_secret_post"
+        }
+      },
+      "settings": {
+        "oauthClient": {
+          "redirect_uris": [
+            "https://example.com/callback"
+          ],
+          "response_types": ["code"],
+          "grant_types": ["authorization_code"]
+        }
+      }
+    }
+  },
+  {
+    "event_type": "group.assign_user",
+    "request_body": {
+      "groupId": {
+        "$ref": { "step": 4, "jsonPath": "id" }
+      },
+      "userId": {
+        "$ref": { "step": 1, "jsonPath": "id" }
+      }
+    }
+  },
+  {
+    "event_type": "group.assign_user",
+    "request_body": {
+      "groupId": {
+        "$ref": { "step": 5, "jsonPath": "id" }
+      },
+      "userId": {
+        "$ref": { "step": 2, "jsonPath": "id" }
+      }
+    }
+  },
+  {
+    "event_type": "group.assign_user",
+    "request_body": {
+      "groupId": {
+        "$ref": { "step": 6, "jsonPath": "id" }
+      },
+      "userId": {
+        "$ref": { "step": 3, "jsonPath": "id" }
+      }
+    }
+  },
+  {
+    "event_type": "delay",
+    "request_body": {
+      "seconds": 10
+    }
+  },
+  {
+    "event_type": "group.assign_user",
+    "request_body": {
+      "groupId": {
+        "$ref": { "step": 5, "jsonPath": "id" }
+      },
+      "userId": {
+        "$ref": { "step": 1, "jsonPath": "id" }
+      }
+    }
+  },
+  {
+    "event_type": "group.assign_user",
+    "request_body": {
+      "groupId": {
+        "$ref": { "step": 6, "jsonPath": "id" }
+      },
+      "userId": {
+        "$ref": { "step": 2, "jsonPath": "id" }
+      }
+    }
+  },
+  {
+    "event_type": "group.assign_user",
+    "request_body": {
+      "groupId": {
+        "$ref": { "step": 4, "jsonPath": "id" }
+      },
+      "userId": {
+        "$ref": { "step": 3, "jsonPath": "id" }
+      }
+    }
+  }
+]
